@@ -78,7 +78,12 @@ export CGO_ENABLED=1
 ## Usage
 
 1. Build the DLL using one of the methods above
-2. Load the DLL in a Windows application
+2. Build and run the loader:
+   ```bash
+   cd loader
+   go build
+   ./loader.exe
+   ```
 3. A console window will open automatically
 4. Use the interactive shell to issue commands
 
