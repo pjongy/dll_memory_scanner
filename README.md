@@ -2,6 +2,16 @@
 
 This project implements a Windows DLL that provides memory scanning functionality similar to Cheat Engine. When loaded into another application, it opens a console window with an interactive command shell that allows you to scan, read, and modify memory.
 
+## Project Structure
+
+The project is organized into the following files:
+
+- `module.go` - Main package, initialization code, and shared constants
+- `memory_scanner.go` - Memory scanning functionality 
+- `default_handler.go` - Basic command handler implementation
+- `memory_scanner_handler.go` - Memory scanner command handler 
+- `command_receiver.go` - Command line interface management
+
 ## Building on Windows
 
 To build the DLL directly on Windows:
@@ -48,7 +58,6 @@ export CC=x86_64-w64-mingw32-gcc
 export GOOS=windows
 export GOARCH=amd64
 export CGO_ENABLED=1
-# and vi module.go
 ```
 
 ## Features
