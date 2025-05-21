@@ -68,8 +68,10 @@ export CGO_ENABLED=1
   - Scan for specific values (int32, hex patterns)
   - Filter previous scan results
   - Wildcard support for hex pattern scanning using "??" notation
+  - **Value change monitoring** (scan for values that changed, unchanged, increased, or decreased)
   - Read memory from specific addresses
   - Write values to memory
+- **Multithreaded scanning** - Uses goroutines for faster memory scans
 - Memory region enumeration and information
 - Extensible command handler system
 
@@ -92,6 +94,11 @@ export CGO_ENABLED=1
 - `scan int32 [value]` - Scan memory for a 32-bit integer value
 - `scan hex [pattern]` - Scan memory for a hex pattern (e.g., `scan hex FF??DE`)
   - Use `??` as wildcards in the pattern to match any byte
+- `scan changed` - Find addresses whose values changed since last stored scan
+- `scan unchanged` - Find addresses whose values didn't change
+- `scan increased` - Find addresses whose values increased
+- `scan decreased` - Find addresses whose values decreased
+- `store` - Store current scan results for future value change comparisons
 - `filter [value]` - Filter previous results for a new value
 - `memory list` - List all readable memory regions
 - `memory read [address] [length]` - Read memory at specified address

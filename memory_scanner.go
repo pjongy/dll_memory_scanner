@@ -5,10 +5,27 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 )
+
+// Scan types for memory value change monitoring
+const (
+	ValueTypeExact     = iota // Exact value match
+	ValueTypeChanged          // Value changed since last scan
+	ValueTypeUnchanged        // Value unchanged since last scan
+	ValueTypeIncreased        // Value increased since last scan
+	ValueTypeDecreased        // Value decreased since last scan
+)
+
+// ScanResult stores a scan result with address and value
+type ScanResult struct {
+	Address uintptr
+	Value   []byte
+}
 
 // MEMORY_BASIC_INFORMATION structure
 type MEMORY_BASIC_INFORMATION struct {
@@ -24,9 +41,11 @@ type MEMORY_BASIC_INFORMATION struct {
 // MemoryScanner handles memory scanning operations
 type MemoryScanner struct {
 	memoryRegions []MEMORY_BASIC_INFORMATION
-	results       []uintptr
+	results       []ScanResult
+	previousScan  []ScanResult
 	processHandle uintptr
 	processID     uint32
+	mutex         sync.Mutex // For thread safety
 }
 
 func NewMemoryScanner() *MemoryScanner {
@@ -35,10 +54,31 @@ func NewMemoryScanner() *MemoryScanner {
 
 	return &MemoryScanner{
 		memoryRegions: []MEMORY_BASIC_INFORMATION{},
-		results:       []uintptr{},
+		results:       []ScanResult{},
+		previousScan:  []ScanResult{},
 		processHandle: handle,
 		processID:     uint32(id),
 	}
+}
+
+// GetResults returns the current scan results addresses
+func (scanner *MemoryScanner) GetResults() []uintptr {
+	addresses := make([]uintptr, len(scanner.results))
+	for i, result := range scanner.results {
+		addresses[i] = result.Address
+	}
+	return addresses
+}
+
+// StoreCurrentResults saves current results for future comparison
+func (scanner *MemoryScanner) StoreCurrentResults() {
+	scanner.previousScan = make([]ScanResult, len(scanner.results))
+	copy(scanner.previousScan, scanner.results)
+}
+
+// SaveNamedResults saves current scan results with a name for later retrieval
+func (scanner *MemoryScanner) SaveNamedResults(name string) {
+	// Would implement storing results in a map
 }
 
 // ParseHexPattern parses a hex string with wildcards
@@ -79,6 +119,9 @@ func ParseHexPattern(hexStr string) ([]byte, []byte, error) {
 
 // EnumerateMemoryRegions finds all readable memory regions
 func (scanner *MemoryScanner) EnumerateMemoryRegions() error {
+	scanner.mutex.Lock()
+	defer scanner.mutex.Unlock()
+
 	scanner.memoryRegions = []MEMORY_BASIC_INFORMATION{}
 
 	var address uintptr
@@ -121,60 +164,172 @@ func isReadable(protect uint32) bool {
 		PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY) != 0
 }
 
-// SearchInt32 searches for a 32-bit integer value in memory
+// SearchInt32 searches for a 32-bit integer value in memory using goroutines
 func (scanner *MemoryScanner) SearchInt32(value int32) {
-	scanner.results = []uintptr{}
+	scanner.mutex.Lock()
+	defer scanner.mutex.Unlock()
 
 	// First ensure we have the memory regions
 	if len(scanner.memoryRegions) == 0 {
 		scanner.EnumerateMemoryRegions()
 	}
 
+	// Convert value to bytes
 	valueBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(valueBytes, uint32(value))
 
-	for _, region := range scanner.memoryRegions {
-		// Read memory region
-		buffer := make([]byte, region.RegionSize)
+	// Determine number of goroutines to use (half of available CPU cores)
+	numCPU := runtime.NumCPU()
+	numWorkers := numCPU / 2
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
 
-		// In the same process, we can directly read memory
-		for i := uintptr(0); i < region.RegionSize; i++ {
-			// Use defer/recover to handle any access violations
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						// Memory access failed, skip this address
-					}
-				}()
+	var wg sync.WaitGroup
+	resultsChan := make(chan ScanResult, 1000)
 
-				// Read byte directly
-				if i < region.RegionSize {
-					buffer[i] = *(*byte)(unsafe.Pointer(region.BaseAddress + i))
-				}
-			}()
+	// Divide regions among workers
+	regionsPerWorker := (len(scanner.memoryRegions) + numWorkers - 1) / numWorkers
+
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		startIdx := w * regionsPerWorker
+		endIdx := (w + 1) * regionsPerWorker
+		if endIdx > len(scanner.memoryRegions) {
+			endIdx = len(scanner.memoryRegions)
 		}
 
-		// Search for value in buffer
-		for i := 0; i <= len(buffer)-4; i++ {
-			if bytes.Equal(buffer[i:i+4], valueBytes) {
-				address := region.BaseAddress + uintptr(i)
-				scanner.results = append(scanner.results, address)
+		go func(regions []MEMORY_BASIC_INFORMATION) {
+			defer wg.Done()
+
+			for _, region := range regions {
+				// Read memory region
+				buffer := make([]byte, region.RegionSize)
+
+				// In the same process, we can directly read memory
+				for i := uintptr(0); i < region.RegionSize; i++ {
+					// Use defer/recover to handle any access violations
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								// Memory access failed, skip this address
+							}
+						}()
+
+						// Read byte directly
+						if i < region.RegionSize {
+							buffer[i] = *(*byte)(unsafe.Pointer(region.BaseAddress + i))
+						}
+					}()
+				}
+
+				// Search for value in buffer
+				for i := 0; i <= len(buffer)-4; i++ {
+					if bytes.Equal(buffer[i:i+4], valueBytes) {
+						address := region.BaseAddress + uintptr(i)
+						resultValue := make([]byte, 4)
+						copy(resultValue, buffer[i:i+4])
+						resultsChan <- ScanResult{Address: address, Value: resultValue}
+					}
+				}
 			}
+		}(scanner.memoryRegions[startIdx:endIdx])
+	}
+
+	// Close channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Clear previous results and collect new ones
+	scanner.results = []ScanResult{}
+	for result := range resultsChan {
+		scanner.results = append(scanner.results, result)
+	}
+}
+
+// MonitorInt32Values scans for changes based on previous scan
+func (scanner *MemoryScanner) MonitorInt32Values(scanType int) {
+	scanner.mutex.Lock()
+	defer scanner.mutex.Unlock()
+
+	// Need previous scan results to compare
+	if len(scanner.previousScan) == 0 {
+		fmt.Println("No previous scan results to compare with")
+		return
+	}
+
+	// Store current values from all previous addresses
+	currentValues := make(map[uintptr]int32)
+	for _, prevResult := range scanner.previousScan {
+		// Read current value at this address
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Memory access failed, skip this address
+				}
+			}()
+
+			// Read 4 bytes directly as int32
+			value := *(*int32)(unsafe.Pointer(prevResult.Address))
+			currentValues[prevResult.Address] = value
+		}()
+	}
+
+	// Compare values based on scan type
+	scanner.results = []ScanResult{}
+	for address, currentValue := range currentValues {
+		// Get previous value
+		var previousValue int32
+		for _, prevResult := range scanner.previousScan {
+			if prevResult.Address == address {
+				previousValue = int32(binary.LittleEndian.Uint32(prevResult.Value))
+				break
+			}
+		}
+
+		// Check if this address matches the scan criteria
+		matchFound := false
+		switch scanType {
+		case ValueTypeChanged:
+			matchFound = currentValue != previousValue
+		case ValueTypeUnchanged:
+			matchFound = currentValue == previousValue
+		case ValueTypeIncreased:
+			matchFound = currentValue > previousValue
+		case ValueTypeDecreased:
+			matchFound = currentValue < previousValue
+		}
+
+		if matchFound {
+			// Store the result
+			valueBytes := make([]byte, 4)
+			binary.LittleEndian.PutUint32(valueBytes, uint32(currentValue))
+			scanner.results = append(scanner.results, ScanResult{
+				Address: address,
+				Value:   valueBytes,
+			})
 		}
 	}
 }
 
 // FilterInt32 filters previous results with a new int32 value
 func (scanner *MemoryScanner) FilterInt32(value int32) {
+	scanner.mutex.Lock()
+	defer scanner.mutex.Unlock()
+
 	if len(scanner.results) == 0 {
 		return
 	}
 
-	newResults := []uintptr{}
 	valueBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(valueBytes, uint32(value))
 
-	for _, address := range scanner.results {
+	newResults := []ScanResult{}
+
+	for _, result := range scanner.results {
 		// Use defer/recover to handle any access violations
 		func() {
 			defer func() {
@@ -186,11 +341,14 @@ func (scanner *MemoryScanner) FilterInt32(value int32) {
 			// Read 4 bytes directly
 			buffer := make([]byte, 4)
 			for i := 0; i < 4; i++ {
-				buffer[i] = *(*byte)(unsafe.Pointer(address + uintptr(i)))
+				buffer[i] = *(*byte)(unsafe.Pointer(result.Address + uintptr(i)))
 			}
 
 			if bytes.Equal(buffer, valueBytes) {
-				newResults = append(newResults, address)
+				newResults = append(newResults, ScanResult{
+					Address: result.Address,
+					Value:   buffer,
+				})
 			}
 		}()
 	}
@@ -200,52 +358,94 @@ func (scanner *MemoryScanner) FilterInt32(value int32) {
 
 // SearchBytesWithMask searches for a byte pattern in memory with wildcard support
 func (scanner *MemoryScanner) SearchBytesWithMask(pattern []byte, mask []byte) {
-	scanner.results = []uintptr{}
+	scanner.mutex.Lock()
+	defer scanner.mutex.Unlock()
 
 	// First ensure we have the memory regions
 	if len(scanner.memoryRegions) == 0 {
 		scanner.EnumerateMemoryRegions()
 	}
 
-	for _, region := range scanner.memoryRegions {
-		// Read memory region
-		buffer := make([]byte, region.RegionSize)
+	// Determine number of goroutines to use (half of available CPU cores)
+	numCPU := runtime.NumCPU()
+	numWorkers := numCPU / 2
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
 
-		// In the same process, we can directly read memory
-		for i := uintptr(0); i < region.RegionSize; i++ {
-			// Use defer/recover to handle any access violations
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						// Memory access failed, skip this address
+	var wg sync.WaitGroup
+	resultsChan := make(chan ScanResult, 1000)
+
+	// Divide regions among workers
+	regionsPerWorker := (len(scanner.memoryRegions) + numWorkers - 1) / numWorkers
+
+	// Start workers
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		startIdx := w * regionsPerWorker
+		endIdx := (w + 1) * regionsPerWorker
+		if endIdx > len(scanner.memoryRegions) {
+			endIdx = len(scanner.memoryRegions)
+		}
+
+		go func(regions []MEMORY_BASIC_INFORMATION) {
+			defer wg.Done()
+
+			for _, region := range regions {
+				// Read memory region
+				buffer := make([]byte, region.RegionSize)
+
+				// In the same process, we can directly read memory
+				for i := uintptr(0); i < region.RegionSize; i++ {
+					// Use defer/recover to handle any access violations
+					func() {
+						defer func() {
+							if r := recover(); r != nil {
+								// Memory access failed, skip this address
+							}
+						}()
+
+						// Read byte directly
+						if i < region.RegionSize {
+							buffer[i] = *(*byte)(unsafe.Pointer(region.BaseAddress + i))
+						}
+					}()
+				}
+
+				// Search for pattern in buffer with mask
+				patternLen := len(pattern)
+				for i := 0; i <= len(buffer)-patternLen; i++ {
+					match := true
+
+					for j := 0; j < patternLen; j++ {
+						// If mask is 0, this is a wildcard - always matches
+						// If mask is 1, bytes must match exactly
+						if mask[j] == 1 && buffer[i+j] != pattern[j] {
+							match = false
+							break
+						}
 					}
-				}()
 
-				// Read byte directly
-				if i < region.RegionSize {
-					buffer[i] = *(*byte)(unsafe.Pointer(region.BaseAddress + i))
-				}
-			}()
-		}
-
-		// Search for pattern in buffer with mask
-		patternLen := len(pattern)
-		for i := 0; i <= len(buffer)-patternLen; i++ {
-			match := true
-
-			for j := 0; j < patternLen; j++ {
-				// If mask is 0, this is a wildcard - always matches
-				// If mask is 1, bytes must match exactly
-				if mask[j] == 1 && buffer[i+j] != pattern[j] {
-					match = false
-					break
+					if match {
+						address := region.BaseAddress + uintptr(i)
+						resultValue := make([]byte, patternLen)
+						copy(resultValue, buffer[i:i+patternLen])
+						resultsChan <- ScanResult{Address: address, Value: resultValue}
+					}
 				}
 			}
+		}(scanner.memoryRegions[startIdx:endIdx])
+	}
 
-			if match {
-				address := region.BaseAddress + uintptr(i)
-				scanner.results = append(scanner.results, address)
-			}
-		}
+	// Close channel when all workers are done
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	// Clear previous results and collect new ones
+	scanner.results = []ScanResult{}
+	for result := range resultsChan {
+		scanner.results = append(scanner.results, result)
 	}
 }
