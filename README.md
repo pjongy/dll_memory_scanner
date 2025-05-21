@@ -99,6 +99,9 @@ export CGO_ENABLED=1
 - `scan increased` - Find addresses whose values increased
 - `scan decreased` - Find addresses whose values decreased
 - `store` - Store current scan results for future value change comparisons
+- `view [page_size]` - View current scan results with pagination (default page size: 10)
+  - Use `n` for next page, `p` for previous page, `q` to quit viewing
+  - Can enter page number directly to jump to that page
 - `filter [value]` - Filter previous results for a new value
 - `memory list` - List all readable memory regions
 - `memory read [address] [length]` - Read memory at specified address

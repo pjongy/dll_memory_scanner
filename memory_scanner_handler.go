@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -18,22 +20,98 @@ func NewMemoryScannerCommandHandler() *MemoryScannerCommandHandler {
 	}
 }
 
+// viewResults displays scan results in pages with navigation
+func (h *MemoryScannerCommandHandler) viewResults(pageSize int) {
+	addresses := h.scanner.GetResults()
+	if len(addresses) == 0 {
+		fmt.Println("No results to display")
+		return
+	}
+
+	totalPages := (len(addresses) + pageSize - 1) / pageSize
+	currentPage := 1
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Printf("\n--- Results Page %d/%d (Total: %d) ---\n", currentPage, totalPages, len(addresses))
+
+		// Calculate page bounds
+		startIdx := (currentPage - 1) * pageSize
+		endIdx := startIdx + pageSize
+		if endIdx > len(addresses) {
+			endIdx = len(addresses)
+		}
+
+		// Display addresses and values for current page
+		for i := startIdx; i < endIdx; i++ {
+			addr := addresses[i]
+
+			// Try to read the current value
+			var value int32
+			var valueStr string
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						valueStr = "[ERROR]"
+					}
+				}()
+
+				// Read current value
+				value = *(*int32)(unsafe.Pointer(addr))
+				valueStr = fmt.Sprintf("%d (0x%X)", value, uint32(value))
+			}()
+
+			fmt.Printf("%3d: 0x%X = %s\n", i+1, addr, valueStr)
+		}
+
+		// Navigation prompt
+		fmt.Print("\nNavigation - n(ext)/p(revious)/q(uit): ")
+		input, _ := reader.ReadString('\n')
+		input = strings.TrimSpace(input)
+
+		switch input {
+		case "n", "next":
+			if currentPage < totalPages {
+				currentPage++
+			}
+		case "p", "prev", "previous":
+			if currentPage > 1 {
+				currentPage--
+			}
+		case "q", "quit", "exit":
+			return
+		default:
+			// Try to parse as a page number
+			if pageNum, err := strconv.Atoi(input); err == nil && pageNum > 0 && pageNum <= totalPages {
+				currentPage = pageNum
+			}
+		}
+	}
+}
+
 func (h *MemoryScannerCommandHandler) HandleCommand(cmd string, args []string) bool {
 	switch cmd {
 	case "scan":
-		if len(args) < 2 {
+		if len(args) < 1 {
 			fmt.Println("Usage: scan [type] [value]")
-			fmt.Println("Types: int32, hex")
-			fmt.Println("Example: scan hex FF??DE")
-			fmt.Println("Note: Use ?? as wildcards in hex pattern")
+			fmt.Println("Types: int32, hex, changed, unchanged, increased, decreased")
+			fmt.Println("Example: scan int32 100")
+			fmt.Println("Example: scan hex FF??DE (use ?? as wildcards)")
+			fmt.Println("Example: scan changed (requires previous scan)")
 			return true
 		}
 
 		scanType := args[0]
-		valueStr := args[1]
 
 		switch scanType {
 		case "int32":
+			if len(args) < 2 {
+				fmt.Println("Usage: scan int32 [value]")
+				return true
+			}
+
+			valueStr := args[1]
 			value, err := strconv.ParseInt(valueStr, 10, 32)
 			if err != nil {
 				fmt.Printf("Invalid value: %s\n", err)
@@ -42,16 +120,24 @@ func (h *MemoryScannerCommandHandler) HandleCommand(cmd string, args []string) b
 
 			fmt.Println("Scanning memory for int32 value:", value)
 			h.scanner.SearchInt32(int32(value))
-			fmt.Printf("Found %d matches\n", len(h.scanner.results))
 
-			if len(h.scanner.results) > 0 && len(h.scanner.results) <= 100 {
+			addresses := h.scanner.GetResults()
+			fmt.Printf("Found %d matches\n", len(addresses))
+
+			if len(addresses) > 0 && len(addresses) <= 100 {
 				fmt.Println("Addresses:")
-				for _, addr := range h.scanner.results {
+				for _, addr := range addresses {
 					fmt.Printf("0x%X\n", addr)
 				}
 			}
 
 		case "hex":
+			if len(args) < 2 {
+				fmt.Println("Usage: scan hex [pattern]")
+				return true
+			}
+
+			valueStr := args[1]
 			pattern, mask, err := ParseHexPattern(valueStr)
 			if err != nil {
 				fmt.Printf("Invalid hex pattern: %s\n", err)
@@ -70,19 +156,60 @@ func (h *MemoryScannerCommandHandler) HandleCommand(cmd string, args []string) b
 			fmt.Printf("Scanning memory for hex pattern: %s\n", strings.TrimSpace(patternDisplay))
 
 			h.scanner.SearchBytesWithMask(pattern, mask)
-			fmt.Printf("Found %d matches\n", len(h.scanner.results))
 
-			if len(h.scanner.results) > 0 && len(h.scanner.results) <= 100 {
+			addresses := h.scanner.GetResults()
+			fmt.Printf("Found %d matches\n", len(addresses))
+
+			if len(addresses) > 0 && len(addresses) <= 100 {
 				fmt.Println("Addresses:")
-				for _, addr := range h.scanner.results {
+				for _, addr := range addresses {
+					fmt.Printf("0x%X\n", addr)
+				}
+			}
+
+		case "changed", "unchanged", "increased", "decreased":
+			// Value change monitoring commands
+			fmt.Printf("Checking for %s values since previous scan...\n", scanType)
+
+			var scanTypeValue int
+			switch scanType {
+			case "changed":
+				scanTypeValue = ValueTypeChanged
+			case "unchanged":
+				scanTypeValue = ValueTypeUnchanged
+			case "increased":
+				scanTypeValue = ValueTypeIncreased
+			case "decreased":
+				scanTypeValue = ValueTypeDecreased
+			}
+
+			h.scanner.MonitorInt32Values(scanTypeValue)
+
+			addresses := h.scanner.GetResults()
+			fmt.Printf("Found %d matches\n", len(addresses))
+
+			if len(addresses) > 0 && len(addresses) <= 100 {
+				fmt.Println("Addresses:")
+				for _, addr := range addresses {
 					fmt.Printf("0x%X\n", addr)
 				}
 			}
 
 		default:
-			fmt.Println("Unknown scan type. Use 'int32' or 'hex'")
+			fmt.Println("Unknown scan type. Use 'int32', 'hex', 'changed', 'unchanged', 'increased', or 'decreased'")
 		}
 
+		return true
+
+	case "view":
+		pageSize := 10 // Default page size
+		if len(args) > 0 {
+			if size, err := strconv.Atoi(args[0]); err == nil && size > 0 {
+				pageSize = size
+			}
+		}
+
+		h.viewResults(pageSize)
 		return true
 
 	case "filter":
@@ -99,15 +226,22 @@ func (h *MemoryScannerCommandHandler) HandleCommand(cmd string, args []string) b
 
 		fmt.Println("Filtering previous results for value:", value)
 		h.scanner.FilterInt32(int32(value))
-		fmt.Printf("Found %d matches after filtering\n", len(h.scanner.results))
 
-		if len(h.scanner.results) > 0 && len(h.scanner.results) <= 100 {
+		addresses := h.scanner.GetResults()
+		fmt.Printf("Found %d matches after filtering\n", len(addresses))
+
+		if len(addresses) > 0 && len(addresses) <= 100 {
 			fmt.Println("Addresses:")
-			for _, addr := range h.scanner.results {
+			for _, addr := range addresses {
 				fmt.Printf("0x%X\n", addr)
 			}
 		}
 
+		return true
+
+	case "store":
+		fmt.Println("Storing current results for future comparison...")
+		h.scanner.StoreCurrentResults()
 		return true
 
 	case "memory":
@@ -293,8 +427,10 @@ func (h *MemoryScannerCommandHandler) HandleCommand(cmd string, args []string) b
 
 func (h *MemoryScannerCommandHandler) GetHelp() map[string]string {
 	return map[string]string{
-		"scan":   "Scan memory for values - scan [type] [value]",
+		"scan":   "Scan memory - scan [type] [value] - Types: int32, hex, changed, unchanged, increased, decreased",
+		"view":   "View current results with paging - view [page_size]",
 		"filter": "Filter previous results - filter [value]",
+		"store":  "Store current results for comparison in future scans",
 		"memory": "Memory operations - memory list|read|write [args]",
 	}
 }
