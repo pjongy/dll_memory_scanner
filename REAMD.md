@@ -1,6 +1,6 @@
-# Windows DLL with Go
+# Windows DLL Memory Scanner
 
-This project demonstrates how to create a Windows DLL in Go that opens a console with an interactive command shell when loaded.
+This project implements a Windows DLL that provides memory scanning functionality similar to Cheat Engine. When loaded into another application, it opens a console window with an interactive command shell that allows you to scan, read, and modify memory.
 
 ## Building on Windows
 
@@ -40,4 +40,51 @@ CGO_ENABLED=1 \
 go build -buildmode=c-shared -o mymodule.dll
 ```
 
-This will generate a Windows-compatible DLL that can be loaded on a Windows system.
+For Linux users using vim with gopls, you may need to export these variables to ensure they are available to the language server:
+
+```bash
+# Add to ~/.bashrc or ~/.profile
+export CC=x86_64-w64-mingw32-gcc
+export GOOS=windows
+export GOARCH=amd64
+export CGO_ENABLED=1
+# and vi module.go
+```
+
+## Features
+
+- Creates a console window when the DLL is loaded
+- Provides an interactive command-line interface
+- Memory scanning features similar to Cheat Engine:
+  - Scan for specific values (int32, hex patterns)
+  - Filter previous scan results
+  - Wildcard support for hex pattern scanning using "??" notation
+  - Read memory from specific addresses
+  - Write values to memory
+- Memory region enumeration and information
+- Extensible command handler system
+
+## Usage
+
+1. Build the DLL using one of the methods above
+2. Load the DLL in a Windows application
+3. A console window will open automatically
+4. Use the interactive shell to issue commands
+
+## Command Reference
+
+### Basic Commands
+- `help` - Display available commands
+- `exit` - Exit the program
+- `echo [text]` - Display the provided text
+- `info` - Display process information
+
+### Memory Scanner Commands
+- `scan int32 [value]` - Scan memory for a 32-bit integer value
+- `scan hex [pattern]` - Scan memory for a hex pattern (e.g., `scan hex FF??DE`)
+  - Use `??` as wildcards in the pattern to match any byte
+- `filter [value]` - Filter previous results for a new value
+- `memory list` - List all readable memory regions
+- `memory read [address] [length]` - Read memory at specified address
+- `memory write [address] [type] [value]` - Write value to memory address
+  - Types: int32, byte
