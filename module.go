@@ -39,7 +39,8 @@ type CommandHandler interface {
 func init() {
 	// Run in a goroutine to avoid blocking the main thread
 	go func() {
-		// Create console window
+		// Free any existing console, then create a new one
+		freeConsole.Call()
 		r, _, _ := allocConsole.Call()
 		if r == 0 {
 			return
