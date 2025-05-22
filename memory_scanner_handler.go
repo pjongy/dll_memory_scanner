@@ -253,7 +253,7 @@ func (h *MemoryScannerCommandHandler) HandleCommand(cmd string, args []string) b
 		switch args[0] {
 		case "list":
 			fmt.Println("Enumerating memory regions...")
-			err := h.scanner.EnumerateMemoryRegions()
+			err := h.scanner.EnumerateMemoryRegions(true) // Need lock when called independently
 			if err != nil {
 				fmt.Printf("Error: %s\n", err)
 				return true

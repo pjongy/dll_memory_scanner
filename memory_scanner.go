@@ -8,7 +8,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -36,6 +38,48 @@ type MEMORY_BASIC_INFORMATION struct {
 	State             uint32
 	Protect           uint32
 	Type              uint32
+}
+
+// ProgressTracker tracks scanning progress
+type ProgressTracker struct {
+	totalRegions     int64
+	processedRegions int64
+	totalBytes       int64
+	processedBytes   int64
+	startTime        time.Time
+	mutex            sync.RWMutex
+}
+
+func NewProgressTracker() *ProgressTracker {
+	return &ProgressTracker{
+		startTime: time.Now(),
+	}
+}
+
+func (p *ProgressTracker) SetTotal(regions int, bytes int64) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.totalRegions = int64(regions)
+	p.totalBytes = bytes
+}
+
+func (p *ProgressTracker) AddProcessed(bytes int64) {
+	atomic.AddInt64(&p.processedRegions, 1)
+	atomic.AddInt64(&p.processedBytes, bytes)
+}
+
+func (p *ProgressTracker) GetProgress() (float64, float64, time.Duration) {
+	processedRegions := atomic.LoadInt64(&p.processedRegions)
+	processedBytes := atomic.LoadInt64(&p.processedBytes)
+
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
+
+	regionProgress := float64(processedRegions) / float64(p.totalRegions) * 100
+	byteProgress := float64(processedBytes) / float64(p.totalBytes) * 100
+	elapsed := time.Since(p.startTime)
+
+	return regionProgress, byteProgress, elapsed
 }
 
 // MemoryScanner handles memory scanning operations
@@ -118,13 +162,17 @@ func ParseHexPattern(hexStr string) ([]byte, []byte, error) {
 }
 
 // EnumerateMemoryRegions finds all readable memory regions
-func (scanner *MemoryScanner) EnumerateMemoryRegions() error {
-	scanner.mutex.Lock()
-	defer scanner.mutex.Unlock()
+func (scanner *MemoryScanner) EnumerateMemoryRegions(needLock bool) error {
+	if needLock {
+		scanner.mutex.Lock()
+		defer scanner.mutex.Unlock()
+	}
 
+	fmt.Println("Enumerating memory regions...")
 	scanner.memoryRegions = []MEMORY_BASIC_INFORMATION{}
 
 	var address uintptr
+	regionCount := 0
 	for {
 		var mbi MEMORY_BASIC_INFORMATION
 		ret, _, err := virtualQuery.Call(
@@ -141,6 +189,8 @@ func (scanner *MemoryScanner) EnumerateMemoryRegions() error {
 			return err
 		}
 
+		regionCount++
+
 		// Add region if it's committed memory and readable
 		if mbi.State&MEM_COMMIT != 0 && isReadable(mbi.Protect) {
 			scanner.memoryRegions = append(scanner.memoryRegions, mbi)
@@ -155,6 +205,8 @@ func (scanner *MemoryScanner) EnumerateMemoryRegions() error {
 		}
 	}
 
+	fmt.Printf("Found %d readable regions out of %d total\n", len(scanner.memoryRegions), regionCount)
+
 	return nil
 }
 
@@ -164,6 +216,72 @@ func isReadable(protect uint32) bool {
 		PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY) != 0
 }
 
+// showProgress displays real-time progress
+func showProgress(tracker *ProgressTracker, done chan bool) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	fmt.Println("Scanning progress:")
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			regionProgress, byteProgress, elapsed := tracker.GetProgress()
+
+			// Create simple progress bar
+			barWidth := 20
+			regionBars := int(regionProgress * float64(barWidth) / 100)
+			byteBars := int(byteProgress * float64(barWidth) / 100)
+
+			regionBar := strings.Repeat("=", regionBars) + strings.Repeat("-", barWidth-regionBars)
+			byteBar := strings.Repeat("=", byteBars) + strings.Repeat("-", barWidth-byteBars)
+
+			// Print progress on new lines (more reliable on Windows)
+			fmt.Printf("Regions: [%s] %6.1f%% | Bytes: [%s] %6.1f%% | Time: %v\n",
+				regionBar, regionProgress, byteBar, byteProgress, elapsed.Truncate(time.Second))
+		}
+	}
+}
+
+// readMemoryRegion efficiently reads a memory region
+func readMemoryRegion(region MEMORY_BASIC_INFORMATION) []byte {
+	buffer := make([]byte, region.RegionSize)
+
+	// Try to read in larger chunks for better performance
+	chunkSize := uintptr(4096) // 4KB chunks
+
+	for offset := uintptr(0); offset < region.RegionSize; offset += chunkSize {
+		remainingSize := region.RegionSize - offset
+		if remainingSize > chunkSize {
+			remainingSize = chunkSize
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Memory access failed for this chunk, fill with zeros
+					for i := offset; i < offset+remainingSize; i++ {
+						if i < region.RegionSize {
+							buffer[i] = 0
+						}
+					}
+				}
+			}()
+
+			// Read chunk directly
+			for i := uintptr(0); i < remainingSize; i++ {
+				if offset+i < region.RegionSize {
+					buffer[offset+i] = *(*byte)(unsafe.Pointer(region.BaseAddress + offset + i))
+				}
+			}
+		}()
+	}
+
+	return buffer
+}
+
 // SearchInt32 searches for a 32-bit integer value in memory using goroutines
 func (scanner *MemoryScanner) SearchInt32(value int32) {
 	scanner.mutex.Lock()
@@ -171,58 +289,60 @@ func (scanner *MemoryScanner) SearchInt32(value int32) {
 
 	// First ensure we have the memory regions
 	if len(scanner.memoryRegions) == 0 {
-		scanner.EnumerateMemoryRegions()
+		err := scanner.EnumerateMemoryRegions(false) // Don't need lock, already locked
+		if err != nil {
+			fmt.Printf("Error enumerating memory regions: %v\n", err)
+			return
+		}
 	}
 
 	// Convert value to bytes
 	valueBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(valueBytes, uint32(value))
 
-	// Determine number of goroutines to use (half of available CPU cores)
-	numCPU := runtime.NumCPU()
-	numWorkers := numCPU / 2
-	if numWorkers < 1 {
-		numWorkers = 1
+	// Calculate total bytes to scan
+	var totalBytes int64
+	for _, region := range scanner.memoryRegions {
+		totalBytes += int64(region.RegionSize)
 	}
 
-	var wg sync.WaitGroup
-	resultsChan := make(chan ScanResult, 1000)
+	// Use more goroutines for better CPU utilization
+	numCPU := runtime.NumCPU()
+	numWorkers := numCPU * 2 // Use twice the number of CPU cores
+	if numWorkers > len(scanner.memoryRegions) {
+		numWorkers = len(scanner.memoryRegions)
+	}
 
-	// Divide regions among workers
-	regionsPerWorker := (len(scanner.memoryRegions) + numWorkers - 1) / numWorkers
+	// Log scan information
+	fmt.Printf("Scan Info: %d memory regions, %d MB total, %d CPU cores, %d goroutines\n",
+		len(scanner.memoryRegions), totalBytes/(1024*1024), numCPU, numWorkers)
+
+	// Setup progress tracking
+	tracker := NewProgressTracker()
+	tracker.SetTotal(len(scanner.memoryRegions), totalBytes)
+
+	progressDone := make(chan bool)
+	go showProgress(tracker, progressDone)
+
+	var wg sync.WaitGroup
+	resultsChan := make(chan ScanResult, 10000) // Larger buffer
+	regionChan := make(chan MEMORY_BASIC_INFORMATION, len(scanner.memoryRegions))
+
+	// Send all regions to channel
+	for _, region := range scanner.memoryRegions {
+		regionChan <- region
+	}
+	close(regionChan)
 
 	// Start workers
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
-		startIdx := w * regionsPerWorker
-		endIdx := (w + 1) * regionsPerWorker
-		if endIdx > len(scanner.memoryRegions) {
-			endIdx = len(scanner.memoryRegions)
-		}
-
-		go func(regions []MEMORY_BASIC_INFORMATION) {
+		go func() {
 			defer wg.Done()
 
-			for _, region := range regions {
-				// Read memory region
-				buffer := make([]byte, region.RegionSize)
-
-				// In the same process, we can directly read memory
-				for i := uintptr(0); i < region.RegionSize; i++ {
-					// Use defer/recover to handle any access violations
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								// Memory access failed, skip this address
-							}
-						}()
-
-						// Read byte directly
-						if i < region.RegionSize {
-							buffer[i] = *(*byte)(unsafe.Pointer(region.BaseAddress + i))
-						}
-					}()
-				}
+			for region := range regionChan {
+				// Read memory region efficiently
+				buffer := readMemoryRegion(region)
 
 				// Search for value in buffer
 				for i := 0; i <= len(buffer)-4; i++ {
@@ -233,8 +353,11 @@ func (scanner *MemoryScanner) SearchInt32(value int32) {
 						resultsChan <- ScanResult{Address: address, Value: resultValue}
 					}
 				}
+
+				// Update progress
+				tracker.AddProcessed(int64(region.RegionSize))
 			}
-		}(scanner.memoryRegions[startIdx:endIdx])
+		}()
 	}
 
 	// Close channel when all workers are done
@@ -248,6 +371,13 @@ func (scanner *MemoryScanner) SearchInt32(value int32) {
 	for result := range resultsChan {
 		scanner.results = append(scanner.results, result)
 	}
+
+	// Stop progress display
+	progressDone <- true
+
+	// Final progress update
+	fmt.Printf("\nScan completed! Found %d matches in %v\n",
+		len(scanner.results), time.Since(tracker.startTime).Truncate(time.Millisecond))
 }
 
 // MonitorInt32Values scans for changes based on previous scan
@@ -261,8 +391,19 @@ func (scanner *MemoryScanner) MonitorInt32Values(scanType int) {
 		return
 	}
 
+	fmt.Printf("Re-scanning %d addresses for value changes...\n", len(scanner.previousScan))
+
+	// Setup progress tracking
+	tracker := NewProgressTracker()
+	tracker.SetTotal(len(scanner.previousScan), int64(len(scanner.previousScan)*4))
+
+	progressDone := make(chan bool)
+	go showProgress(tracker, progressDone)
+
 	// Store current values from all previous addresses
 	currentValues := make(map[uintptr]int32)
+	processed := int64(0)
+
 	for _, prevResult := range scanner.previousScan {
 		// Read current value at this address
 		func() {
@@ -276,6 +417,16 @@ func (scanner *MemoryScanner) MonitorInt32Values(scanType int) {
 			value := *(*int32)(unsafe.Pointer(prevResult.Address))
 			currentValues[prevResult.Address] = value
 		}()
+
+		processed++
+		if processed%1000 == 0 {
+			tracker.AddProcessed(4000) // 1000 addresses * 4 bytes each
+		}
+	}
+
+	// Add any remaining bytes
+	if remaining := processed % 1000; remaining > 0 {
+		tracker.AddProcessed(remaining * 4)
 	}
 
 	// Compare values based on scan type
@@ -313,6 +464,11 @@ func (scanner *MemoryScanner) MonitorInt32Values(scanType int) {
 			})
 		}
 	}
+
+	// Stop progress display
+	progressDone <- true
+
+	fmt.Printf("\nValue monitoring completed! Found %d matches\n", len(scanner.results))
 }
 
 // FilterInt32 filters previous results with a new int32 value
@@ -323,6 +479,8 @@ func (scanner *MemoryScanner) FilterInt32(value int32) {
 	if len(scanner.results) == 0 {
 		return
 	}
+
+	fmt.Printf("Filtering %d addresses for value %d...\n", len(scanner.results), value)
 
 	valueBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(valueBytes, uint32(value))
@@ -354,6 +512,7 @@ func (scanner *MemoryScanner) FilterInt32(value int32) {
 	}
 
 	scanner.results = newResults
+	fmt.Printf("Filter completed! %d matches remain\n", len(scanner.results))
 }
 
 // SearchBytesWithMask searches for a byte pattern in memory with wildcard support
@@ -363,54 +522,56 @@ func (scanner *MemoryScanner) SearchBytesWithMask(pattern []byte, mask []byte) {
 
 	// First ensure we have the memory regions
 	if len(scanner.memoryRegions) == 0 {
-		scanner.EnumerateMemoryRegions()
+		err := scanner.EnumerateMemoryRegions(false) // Don't need lock, already locked
+		if err != nil {
+			fmt.Printf("Error enumerating memory regions: %v\n", err)
+			return
+		}
 	}
 
-	// Determine number of goroutines to use (half of available CPU cores)
-	numCPU := runtime.NumCPU()
-	numWorkers := numCPU / 2
-	if numWorkers < 1 {
-		numWorkers = 1
+	// Calculate total bytes to scan
+	var totalBytes int64
+	for _, region := range scanner.memoryRegions {
+		totalBytes += int64(region.RegionSize)
 	}
+
+	// Use more goroutines for better CPU utilization
+	numCPU := runtime.NumCPU()
+	numWorkers := numCPU * 2 // Use twice the number of CPU cores
+	if numWorkers > len(scanner.memoryRegions) {
+		numWorkers = len(scanner.memoryRegions)
+	}
+
+	// Log scan information
+	fmt.Printf("Pattern Scan Info: %d memory regions, %d MB total, %d CPU cores, %d goroutines, pattern length: %d bytes\n",
+		len(scanner.memoryRegions), totalBytes/(1024*1024), numCPU, numWorkers, len(pattern))
+
+	// Setup progress tracking
+	tracker := NewProgressTracker()
+	tracker.SetTotal(len(scanner.memoryRegions), totalBytes)
+
+	progressDone := make(chan bool)
+	go showProgress(tracker, progressDone)
 
 	var wg sync.WaitGroup
-	resultsChan := make(chan ScanResult, 1000)
+	resultsChan := make(chan ScanResult, 10000) // Larger buffer
+	regionChan := make(chan MEMORY_BASIC_INFORMATION, len(scanner.memoryRegions))
 
-	// Divide regions among workers
-	regionsPerWorker := (len(scanner.memoryRegions) + numWorkers - 1) / numWorkers
+	// Send all regions to channel
+	for _, region := range scanner.memoryRegions {
+		regionChan <- region
+	}
+	close(regionChan)
 
 	// Start workers
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
-		startIdx := w * regionsPerWorker
-		endIdx := (w + 1) * regionsPerWorker
-		if endIdx > len(scanner.memoryRegions) {
-			endIdx = len(scanner.memoryRegions)
-		}
-
-		go func(regions []MEMORY_BASIC_INFORMATION) {
+		go func() {
 			defer wg.Done()
 
-			for _, region := range regions {
-				// Read memory region
-				buffer := make([]byte, region.RegionSize)
-
-				// In the same process, we can directly read memory
-				for i := uintptr(0); i < region.RegionSize; i++ {
-					// Use defer/recover to handle any access violations
-					func() {
-						defer func() {
-							if r := recover(); r != nil {
-								// Memory access failed, skip this address
-							}
-						}()
-
-						// Read byte directly
-						if i < region.RegionSize {
-							buffer[i] = *(*byte)(unsafe.Pointer(region.BaseAddress + i))
-						}
-					}()
-				}
+			for region := range regionChan {
+				// Read memory region efficiently
+				buffer := readMemoryRegion(region)
 
 				// Search for pattern in buffer with mask
 				patternLen := len(pattern)
@@ -433,8 +594,11 @@ func (scanner *MemoryScanner) SearchBytesWithMask(pattern []byte, mask []byte) {
 						resultsChan <- ScanResult{Address: address, Value: resultValue}
 					}
 				}
+
+				// Update progress
+				tracker.AddProcessed(int64(region.RegionSize))
 			}
-		}(scanner.memoryRegions[startIdx:endIdx])
+		}()
 	}
 
 	// Close channel when all workers are done
@@ -448,4 +612,11 @@ func (scanner *MemoryScanner) SearchBytesWithMask(pattern []byte, mask []byte) {
 	for result := range resultsChan {
 		scanner.results = append(scanner.results, result)
 	}
+
+	// Stop progress display
+	progressDone <- true
+
+	// Final progress update
+	fmt.Printf("\nPattern scan completed! Found %d matches in %v\n",
+		len(scanner.results), time.Since(tracker.startTime).Truncate(time.Millisecond))
 }
