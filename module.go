@@ -9,12 +9,17 @@ import (
 
 var (
 	kernel32            = syscall.NewLazyDLL("kernel32.dll")
+	psapi               = syscall.NewLazyDLL("psapi.dll")
 	allocConsole        = kernel32.NewProc("AllocConsole")
 	freeConsole         = kernel32.NewProc("FreeConsole")
 	virtualQuery        = kernel32.NewProc("VirtualQuery")
 	virtualProtect      = kernel32.NewProc("VirtualProtect")
 	getCurrentProcess   = kernel32.NewProc("GetCurrentProcess")
 	getCurrentProcessId = kernel32.NewProc("GetCurrentProcessId")
+
+	procGetModuleHandle      = kernel32.NewProc("GetModuleHandleW")
+	procGetModuleInformation = psapi.NewProc("GetModuleInformation")
+	hProcess                 = syscall.Handle(^uintptr(0) - 1) // pseudo-handle for current process
 )
 
 // Memory constants

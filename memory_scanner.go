@@ -22,6 +22,13 @@ const (
 	ValueTypeDecreased        // Value decreased since last scan
 )
 
+// MODULEINFO mirrors the WinAPI structure returned by GetModuleInformation
+type MODULEINFO struct {
+	lpBaseOfDll uintptr
+	SizeOfImage uint32
+	EntryPoint  uintptr
+}
+
 // ScanResult stores a scan result with address and value
 type ScanResult struct {
 	Address uintptr
@@ -166,6 +173,15 @@ func (scanner *MemoryScanner) EnumerateMemoryRegions(needLock bool) error {
 		defer scanner.mutex.Unlock()
 	}
 
+	// get module base & size
+	var hMod uintptr
+	procGetModuleHandle.Call(0, uintptr(unsafe.Pointer(&hMod)))
+	var mi MODULEINFO
+	procGetModuleInformation.Call(uintptr(hProcess), hMod,
+		uintptr(unsafe.Pointer(&mi)), unsafe.Sizeof(mi))
+	modStart := mi.lpBaseOfDll
+	modEnd := mi.lpBaseOfDll + uintptr(mi.SizeOfImage)
+
 	scanner.memoryRegions = nil
 	var addr uintptr
 	for {
@@ -178,6 +194,13 @@ func (scanner *MemoryScanner) EnumerateMemoryRegions(needLock bool) error {
 		if ret == 0 {
 			break
 		}
+
+		// skip your module region
+		if mbi.BaseAddress < modEnd && mbi.BaseAddress+mbi.RegionSize > modStart {
+			addr = mbi.BaseAddress + mbi.RegionSize
+			continue
+		}
+
 		if mbi.State&MEM_COMMIT != 0 &&
 			mbi.Protect&(PAGE_READONLY|PAGE_READWRITE|PAGE_WRITECOPY|
 				PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|
