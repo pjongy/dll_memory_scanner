@@ -27,6 +27,7 @@ const (
 	PAGE_EXECUTE_READ      = 0x20
 	PAGE_EXECUTE_READWRITE = 0x40
 	PAGE_EXECUTE_WRITECOPY = 0x80
+	PAGE_GUARD             = 0x100
 )
 
 // CommandHandler interface for processing commands

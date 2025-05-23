@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unsafe"
 )
@@ -161,59 +160,34 @@ func ParseHexPattern(hexStr string) ([]byte, []byte, error) {
 	return pattern, mask, nil
 }
 
-// EnumerateMemoryRegions finds all readable memory regions
 func (scanner *MemoryScanner) EnumerateMemoryRegions(needLock bool) error {
 	if needLock {
 		scanner.mutex.Lock()
 		defer scanner.mutex.Unlock()
 	}
 
-	fmt.Println("Enumerating memory regions...")
-	scanner.memoryRegions = []MEMORY_BASIC_INFORMATION{}
-
-	var address uintptr
-	regionCount := 0
+	scanner.memoryRegions = nil
+	var addr uintptr
 	for {
 		var mbi MEMORY_BASIC_INFORMATION
-		ret, _, err := virtualQuery.Call(
-			address,
+		ret, _, _ := virtualQuery.Call(
+			addr,
 			uintptr(unsafe.Pointer(&mbi)),
 			unsafe.Sizeof(mbi),
 		)
-
 		if ret == 0 {
-			if err != syscall.Errno(0) {
-				// End of enumeration reached
-				break
-			}
-			return err
-		}
-
-		regionCount++
-
-		// Add region if it's committed memory and readable
-		if mbi.State&MEM_COMMIT != 0 && isReadable(mbi.Protect) {
-			scanner.memoryRegions = append(scanner.memoryRegions, mbi)
-		}
-
-		// Move to next region
-		address = mbi.BaseAddress + mbi.RegionSize
-
-		// Break if we've wrapped around (unlikely but possible in 32-bit)
-		if address < mbi.BaseAddress {
 			break
 		}
+		if mbi.State&MEM_COMMIT != 0 &&
+			mbi.Protect&(PAGE_READONLY|PAGE_READWRITE|PAGE_WRITECOPY|
+				PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|
+				PAGE_EXECUTE_WRITECOPY) != 0 &&
+			mbi.Protect&PAGE_GUARD == 0 {
+			scanner.memoryRegions = append(scanner.memoryRegions, mbi)
+		}
+		addr = mbi.BaseAddress + mbi.RegionSize
 	}
-
-	fmt.Printf("Found %d readable regions out of %d total\n", len(scanner.memoryRegions), regionCount)
-
 	return nil
-}
-
-// isReadable checks if the memory protection allows reading
-func isReadable(protect uint32) bool {
-	return protect&(PAGE_READONLY|PAGE_READWRITE|PAGE_WRITECOPY|
-		PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY) != 0
 }
 
 // showProgress displays real-time progress
@@ -245,41 +219,28 @@ func showProgress(tracker *ProgressTracker, done chan bool) {
 	}
 }
 
-// readMemoryRegion efficiently reads a memory region
 func readMemoryRegion(region MEMORY_BASIC_INFORMATION) []byte {
-	buffer := make([]byte, region.RegionSize)
-
-	// Try to read in larger chunks for better performance
-	chunkSize := uintptr(4096) // 4KB chunks
-
-	for offset := uintptr(0); offset < region.RegionSize; offset += chunkSize {
-		remainingSize := region.RegionSize - offset
-		if remainingSize > chunkSize {
-			remainingSize = chunkSize
+	buf := make([]byte, region.RegionSize)
+	const chunk = uintptr(4096)
+	for off := uintptr(0); off < region.RegionSize; off += chunk {
+		size := chunk
+		if region.RegionSize-off < chunk {
+			size = region.RegionSize - off
 		}
-
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Memory access failed for this chunk, fill with zeros
-					for i := offset; i < offset+remainingSize; i++ {
-						if i < region.RegionSize {
-							buffer[i] = 0
-						}
-					}
-				}
-			}()
-
-			// Read chunk directly
-			for i := uintptr(0); i < remainingSize; i++ {
-				if offset+i < region.RegionSize {
-					buffer[offset+i] = *(*byte)(unsafe.Pointer(region.BaseAddress + offset + i))
-				}
-			}
-		}()
+		base := region.BaseAddress + off
+		var mbi MEMORY_BASIC_INFORMATION
+		virtualQuery.Call(
+			base,
+			uintptr(unsafe.Pointer(&mbi)),
+			unsafe.Sizeof(mbi),
+		)
+		if mbi.State&MEM_COMMIT == 0 || mbi.Protect&PAGE_GUARD != 0 {
+			continue
+		}
+		slice := unsafe.Slice((*byte)(unsafe.Pointer(base)), size)
+		copy(buf[off:off+size], slice)
 	}
-
-	return buffer
+	return buf
 }
 
 // SearchInt32 searches for a 32-bit integer value in memory using goroutines
