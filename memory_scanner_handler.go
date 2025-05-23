@@ -21,6 +21,7 @@ func NewMemoryScannerCommandHandler() *MemoryScannerCommandHandler {
 }
 
 // viewResults displays scan results in pages with navigation
+// viewResults displays scan results in pages, re-validating each address against current memory regions
 func (h *MemoryScannerCommandHandler) viewResults(pageSize int) {
 	addresses := h.scanner.GetResults()
 	if len(addresses) == 0 {
@@ -33,6 +34,12 @@ func (h *MemoryScannerCommandHandler) viewResults(pageSize int) {
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
+		// list memory region each time before access
+		if err := h.scanner.EnumerateMemoryRegions(true); err != nil {
+			fmt.Printf("Failed to enumerate memory regions: %v\n", err)
+			return
+		}
+
 		fmt.Printf("\n--- Results Page %d/%d (Total: %d) ---\n", currentPage, totalPages, len(addresses))
 
 		// Calculate page bounds
@@ -46,18 +53,30 @@ func (h *MemoryScannerCommandHandler) viewResults(pageSize int) {
 		for i := startIdx; i < endIdx; i++ {
 			addr := addresses[i]
 
-			// Try to read the current value
+			// 2) Skip any address that is no longer in a committed, readable region
+			valid := false
+			for _, region := range h.scanner.memoryRegions {
+				start := region.BaseAddress
+				end := region.BaseAddress + region.RegionSize
+				if addr >= start && addr+4 <= end { // assuming int32 value display
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				fmt.Printf("%3d: 0x%X = [SKIPPED: region no longer valid]\n", i+1, addr)
+				continue
+			}
+
+			// 3) Safely read the current int32 value
 			var value int32
 			var valueStr string
-
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						valueStr = "[ERROR]"
 					}
 				}()
-
-				// Read current value
 				value = *(*int32)(unsafe.Pointer(addr))
 				valueStr = fmt.Sprintf("%d (0x%X)", value, uint32(value))
 			}()
@@ -82,8 +101,8 @@ func (h *MemoryScannerCommandHandler) viewResults(pageSize int) {
 		case "q", "quit", "exit":
 			return
 		default:
-			// Try to parse as a page number
-			if pageNum, err := strconv.Atoi(input); err == nil && pageNum > 0 && pageNum <= totalPages {
+			// Allow direct page number entry
+			if pageNum, err := strconv.Atoi(input); err == nil && pageNum >= 1 && pageNum <= totalPages {
 				currentPage = pageNum
 			}
 		}
