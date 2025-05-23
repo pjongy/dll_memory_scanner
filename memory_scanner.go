@@ -339,95 +339,101 @@ func (scanner *MemoryScanner) SearchInt32(value int32) {
 		len(scanner.results), time.Since(tracker.startTime).Truncate(time.Millisecond))
 }
 
-// MonitorInt32Values scans for changes based on previous scan
-func (scanner *MemoryScanner) MonitorInt32Values(scanType int) {
+// MonitorValues scans for changes based on previous scan (both int32, hex)
+func (scanner *MemoryScanner) MonitorValues(scanType int) {
 	scanner.mutex.Lock()
 	defer scanner.mutex.Unlock()
 
-	// Need previous scan results to compare
 	if len(scanner.previousScan) == 0 {
 		fmt.Println("No previous scan results to compare with")
 		return
 	}
 
-	fmt.Printf("Re-scanning %d addresses for value changes...\n", len(scanner.previousScan))
+	// 1) Refresh the list of readable memory regions
+	if err := scanner.EnumerateMemoryRegions(false); err != nil {
+		fmt.Println("Failed to enumerate memory regions:", err)
+		return
+	}
 
-	// Setup progress tracking
+	// 2) Calculate total bytes to process for progress tracking
+	var totalBytes int64
+	for _, prev := range scanner.previousScan {
+		totalBytes += int64(len(prev.Value))
+	}
 	tracker := NewProgressTracker()
-	tracker.SetTotal(len(scanner.previousScan), int64(len(scanner.previousScan)*4))
+	tracker.SetTotal(len(scanner.previousScan), totalBytes)
+	done := make(chan bool)
+	go showProgress(tracker, done)
 
-	progressDone := make(chan bool)
-	go showProgress(tracker, progressDone)
+	// 3) Read current values only from valid regions
+	currentValues := make(map[uintptr][]byte, len(scanner.previousScan))
+	for _, prev := range scanner.previousScan {
+		addr := prev.Address
+		size := len(prev.Value)
 
-	// Store current values from all previous addresses
-	currentValues := make(map[uintptr]int32)
-	processed := int64(0)
-
-	for _, prevResult := range scanner.previousScan {
-		// Read current value at this address
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Memory access failed, skip this address
-				}
-			}()
-
-			// Read 4 bytes directly as int32
-			value := *(*int32)(unsafe.Pointer(prevResult.Address))
-			currentValues[prevResult.Address] = value
-		}()
-
-		processed++
-		if processed%1000 == 0 {
-			tracker.AddProcessed(4000) // 1000 addresses * 4 bytes each
+		// Check if this address range is still within a committed, readable region
+		valid := false
+		for _, region := range scanner.memoryRegions {
+			start := region.BaseAddress
+			end := region.BaseAddress + region.RegionSize
+			if addr >= start && addr+uintptr(size) <= end {
+				valid = true
+				break
+			}
 		}
+		if !valid {
+			tracker.AddProcessed(int64(size))
+			continue
+		}
+
+		// Safely read the bytes
+		buf := make([]byte, size)
+		func() {
+			defer func() { recover() }()
+			for i := 0; i < size; i++ {
+				buf[i] = *(*byte)(unsafe.Pointer(addr + uintptr(i)))
+			}
+			currentValues[addr] = append([]byte(nil), buf...)
+		}()
+		tracker.AddProcessed(int64(size))
 	}
 
-	// Add any remaining bytes
-	if remaining := processed % 1000; remaining > 0 {
-		tracker.AddProcessed(remaining * 4)
-	}
-
-	// Compare values based on scan type
-	scanner.results = []ScanResult{}
-	for address, currentValue := range currentValues {
-		// Get previous value
-		var previousValue int32
-		for _, prevResult := range scanner.previousScan {
-			if prevResult.Address == address {
-				previousValue = int32(binary.LittleEndian.Uint32(prevResult.Value))
+	// 4) Compare with previous values and collect matches
+	scanner.results = scanner.results[:0]
+	for addr, cur := range currentValues {
+		// Find the previous byte slice
+		var prevBytes []byte
+		for _, p := range scanner.previousScan {
+			if p.Address == addr {
+				prevBytes = p.Value
 				break
 			}
 		}
 
-		// Check if this address matches the scan criteria
-		matchFound := false
+		// Determine match based on scanType
+		var match bool
 		switch scanType {
 		case ValueTypeChanged:
-			matchFound = currentValue != previousValue
+			match = !bytes.Equal(cur, prevBytes)
 		case ValueTypeUnchanged:
-			matchFound = currentValue == previousValue
+			match = bytes.Equal(cur, prevBytes)
 		case ValueTypeIncreased:
-			matchFound = currentValue > previousValue
+			match = bytes.Compare(cur, prevBytes) > 0
 		case ValueTypeDecreased:
-			matchFound = currentValue < previousValue
+			match = bytes.Compare(cur, prevBytes) < 0
 		}
 
-		if matchFound {
-			// Store the result
-			valueBytes := make([]byte, 4)
-			binary.LittleEndian.PutUint32(valueBytes, uint32(currentValue))
+		if match {
 			scanner.results = append(scanner.results, ScanResult{
-				Address: address,
-				Value:   valueBytes,
+				Address: addr,
+				Value:   cur,
 			})
 		}
 	}
 
-	// Stop progress display
-	progressDone <- true
-
-	fmt.Printf("\nValue monitoring completed! Found %d matches\n", len(scanner.results))
+	// 5) Signal completion of progress display
+	done <- true
+	fmt.Printf("\nMonitoring completed: %d matches found\n", len(scanner.results))
 }
 
 // FilterInt32 filters previous results with a new int32 value

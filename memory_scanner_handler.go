@@ -183,7 +183,7 @@ func (h *MemoryScannerCommandHandler) HandleCommand(cmd string, args []string) b
 				scanTypeValue = ValueTypeDecreased
 			}
 
-			h.scanner.MonitorInt32Values(scanTypeValue)
+			h.scanner.MonitorValues(scanTypeValue)
 
 			addresses := h.scanner.GetResults()
 			fmt.Printf("Found %d matches\n", len(addresses))
