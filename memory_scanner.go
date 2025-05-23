@@ -248,13 +248,11 @@ func (scanner *MemoryScanner) SearchInt32(value int32) {
 	scanner.mutex.Lock()
 	defer scanner.mutex.Unlock()
 
-	// First ensure we have the memory regions
-	if len(scanner.memoryRegions) == 0 {
-		err := scanner.EnumerateMemoryRegions(false) // Don't need lock, already locked
-		if err != nil {
-			fmt.Printf("Error enumerating memory regions: %v\n", err)
-			return
-		}
+	// find memory region each search is called (memory protection can be changed) but not needed for monitor after scan
+	err := scanner.EnumerateMemoryRegions(false) // Don't need lock, already locked
+	if err != nil {
+		fmt.Printf("Error enumerating memory regions: %v\n", err)
+		return
 	}
 
 	// Convert value to bytes
@@ -481,13 +479,11 @@ func (scanner *MemoryScanner) SearchBytesWithMask(pattern []byte, mask []byte) {
 	scanner.mutex.Lock()
 	defer scanner.mutex.Unlock()
 
-	// First ensure we have the memory regions
-	if len(scanner.memoryRegions) == 0 {
-		err := scanner.EnumerateMemoryRegions(false) // Don't need lock, already locked
-		if err != nil {
-			fmt.Printf("Error enumerating memory regions: %v\n", err)
-			return
-		}
+	// find memory region each search is called (memory protection can be changed) but not needed for monitor after scan
+	err := scanner.EnumerateMemoryRegions(false) // Don't need lock, already locked
+	if err != nil {
+		fmt.Printf("Error enumerating memory regions: %v\n", err)
+		return
 	}
 
 	// Calculate total bytes to scan
