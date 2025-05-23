@@ -2,6 +2,8 @@
 
 This project implements a Windows DLL that provides memory scanning functionality similar to Cheat Engine. When loaded into another application, it opens a console window with an interactive command shell that allows you to scan, read, and modify memory.
 
+![Demo](./assets/demo.gif)
+
 ## Project Structure
 
 The project is organized into the following files:
